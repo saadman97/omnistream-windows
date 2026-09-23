@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniStream · Player</title>
+  <script>
+    if ((typeof process !== 'undefined' && process.platform === 'darwin') || (navigator.userAgent.includes('Electron') && /Mac/i.test(navigator.platform || navigator.userAgent))) {
+      document.documentElement.classList.add('is-electron', 'is-mac');
+    }
+  </script>
+  <link href="browser.css" rel="stylesheet">
+</head>
+<body>
+<div class="player-page" id="page">
+  <header class="player-head">
+    <a class="btn btn-ghost btn-sm" href="browser.html" id="backBtn" title="Back to library">← Library</a>
+    <div class="player-drag-spacer" style="min-width:0;flex:1">
+      <div class="title" id="title">Loading…</div>
+      <div class="sub" id="sub"></div>
+    </div>
+    <button class="btn btn-sm" id="prevBtn" title="Previous episode (p)">‹ Prev</button>
+    <button class="btn btn-sm" id="nextBtn" title="Next episode (n)">Next ›</button>
+    <label class="toggle" title="Play the next episode automatically"><input type="checkbox" id="autoNext" checked><span class="track"></span><span style="font-size:12px">Auto-next</span></label>
+    <a class="btn btn-sm" id="rawBtn" target="_blank" rel="noopener" title="Open the raw file in a new tab">Raw</a>
+    <a class="btn btn-sm" id="dlBtn" target="_blank" rel="noopener" download title="Download">Download</a>
+    <button class="btn btn-sm" id="externalBtn" title="Play in default media player (e.g. VLC)">Play Externally</button>
+  </header>
+
+  <div class="stage">
+    <video id="video" controls autoplay playsinline preload="auto"></video>
+    <div class="fail hidden" id="fail">
+      <h3>Chrome can't decode this file</h3>
+      <p id="failText">The container or codec isn't supported by the built-in player. You can still open the raw file in a new tab or download it and play it in VLC.</p>
+      <div class="actions">
+        <a class="btn btn-primary" id="failRaw" target="_blank" rel="noopener">Open raw file</a>
+        <a class="btn" id="failDl" target="_blank" rel="noopener" download>Download</a>
+        <button class="btn" id="failCopy">Copy link</button>
+      </div>
+    </div>
+  </div>
+
+  <aside class="playlist" id="playlist">
+    <h2><span>Folder</span><span id="plCount"></span></h2>
+    <div id="plItems"></div>
+    <div class="shortcuts">
+      <kbd>space</kbd> play / pause<br>
+      <kbd>←</kbd><kbd>→</kbd> seek 10 s · <kbd>j</kbd><kbd>l</kbd> 30 s<br>
+      <kbd>↑</kbd><kbd>↓</kbd> volume · <kbd>m</kbd> mute<br>
+      <kbd>f</kbd> fullscreen · <kbd>n</kbd><kbd>p</kbd> next / previous
+    </div>
+  </aside>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script src="hls.min.js"></script>
+<script src="dash.all.min.js"></script>
+<script src="shared.js"></script>
+<script src="player.js"></script>
+</body>
+</html>

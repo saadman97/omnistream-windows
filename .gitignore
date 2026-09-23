@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.app
+_metadata/
+.claude/
+.gemini/
+*.log
+.DS_Store
