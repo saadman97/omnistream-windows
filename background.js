@@ -1,43 +1,24 @@
 /*
- * background.js — MV3 service worker.
+ * background.js — OmniStream background service (Electron / standalone app).
  *
- * Responsibilities
- *  - Crawl the configured open directories and index every file into IndexedDB.
- *  - Keep per-host connection limits saturated (Chrome allows ~6 sockets per host,
- *    so a global limit alone leaves most servers idle while one is hammered).
- *  - Survive interruptions: crawl state is checkpointed so it can be resumed.
- *  - Maintain declarativeNetRequest rules so extension pages can read media
- *    from user-added servers (thumbnail capture needs CORS headers).
+ * Runs in a hidden BrowserWindow so it has access to IndexedDB and fetch().
+ * shared.js is loaded first by background.html via a <script> tag.
+ * Communication with the renderer is via the chrome.* IPC shim (preload.ts).
  */
-
-importScripts('shared.js');
+'use strict';
 
 /* ------------------------------------------------------------------ */
-/* Action / lifecycle                                                  */
+/* Lifecycle stubs (extension-only APIs not needed in Electron)        */
 /* ------------------------------------------------------------------ */
 
-chrome.action.onClicked.addListener(() => openBrowserTab());
+// chrome.action and chrome.runtime.onInstalled are no-ops in the IPC shim
+// — nothing to do here for Electron.
 
-chrome.runtime.onInstalled.addListener(() => {
-  syncDynamicRules().catch(err => console.warn('Rule sync failed', err));
-});
-
+// Keep storage-change listener for server list changes (CORS rules not needed).
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.servers) {
-    syncDynamicRules().catch(err => console.warn('Rule sync failed', err));
-  }
+  // No declarativeNetRequest in Electron — CORS is handled by Electron's session.
+  // Still useful to react if other parts of the app need to invalidate caches.
 });
-
-async function openBrowserTab() {
-  const url = chrome.runtime.getURL('browser.html');
-  const tabs = await chrome.tabs.query({ url });
-  if (tabs.length) {
-    await chrome.tabs.update(tabs[0].id, { active: true });
-    if (tabs[0].windowId != null) await chrome.windows.update(tabs[0].windowId, { focused: true });
-  } else {
-    await chrome.tabs.create({ url });
-  }
-}
 
 /* ------------------------------------------------------------------ */
 /* Messaging                                                           */
@@ -674,44 +655,54 @@ async function crawlPageServer(root) {
   }
 }
 
-/** Opens `url` in a hidden background tab, waits for it to settle, scrapes media links, closes it. */
+/**
+ * Fetch a page and extract media links from its HTML.
+ * In Electron we can't inject scripts into arbitrary pages (no chrome.tabs / scripting),
+ * so we do a plain fetch + regex parse — works for static open-directory pages and
+ * simple HTML listings. SPAs that need JS to render will return fewer results.
+ */
 async function renderAndExtract(url, timeoutMs) {
   if (crawl.stopRequested) throw new DOMException('Crawl stopped', 'AbortError');
-  const tab = await chrome.tabs.create({ url, active: false });
-  const tabId = tab.id;
-  const deadline = Date.now() + timeoutMs;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
   try {
-    await waitForTabComplete(tabId, Math.max(1000, deadline - Date.now()));
-    // Give client-side rendering (XHR-loaded lists, lazy hydration) a moment to catch up after
-    // 'complete' fires, which for an SPA usually just means the empty app shell finished loading.
-    await sleep(Math.min(4000, Math.max(500, deadline - Date.now())));
-    const injected = await chrome.scripting.executeScript({ target: { tabId }, func: extractPageMedia });
-    const result = injected && injected[0] && injected[0].result;
-    return result || { links: [], pageTitle: '' };
-  } finally {
-    try { await chrome.tabs.remove(tabId); } catch (e) { /* tab may already be gone */ }
-  }
-}
-
-function waitForTabComplete(tabId, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let done = false;
-    const timer = setTimeout(() => finish(() => reject(new Error('Page took too long to load'))), timeoutMs);
-    const listener = (id, info) => { if (id === tabId && info.status === 'complete') finish(resolve); };
-    const removedListener = (id) => { if (id === tabId) finish(() => reject(new Error('Tab was closed'))); };
-    function finish(action) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(listener);
-      chrome.tabs.onRemoved.removeListener(removedListener);
-      action();
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      credentials: 'omit',
+      cache: 'no-store',
+      headers: { Accept: 'text/html,*/*;q=0.8' }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    const links = [];
+    const seen = new Set();
+    const mediaExtRe = /\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|mpg|mpeg|3gp|ogv|mp3|flac|wav|aac|ogg|m4a|opus|wma|m3u8|mpd)(?:[?#]|$)/i;
+    // Parse anchors
+    const anchorRe = /<a\s[^>]*?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]{0,400}?)<\/a>/gi;
+    let m;
+    while ((m = anchorRe.exec(html)) !== null) {
+      const raw = (m[1] ?? m[2] ?? m[3] ?? '').trim();
+      if (!raw || raw.startsWith('#') || raw.startsWith('javascript:')) continue;
+      let href;
+      try { href = new URL(raw, url).href; } catch (e) { continue; }
+      if (mediaExtRe.test(href) && !seen.has(href)) {
+        seen.add(href);
+        links.push({ href, text: m[4].replace(/<[^>]+>/g, '').trim().slice(0, 200) });
+      }
     }
-    chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.onRemoved.addListener(removedListener);
-    // The tab may already have finished loading before these listeners were attached.
-    chrome.tabs.get(tabId).then(t => { if (t.status === 'complete') finish(resolve); }).catch(() => finish(() => reject(new Error('Tab was closed'))));
-  });
+    // Raw stream URL matches (HLS etc embedded in JS blocks)
+    const rawRe = /https?:\/\/[^\s"'<>]+?\.(m3u8|mpd|mp4|mkv|webm)(?:\?[^\s"'<>]*)?/gi;
+    let rm;
+    while ((rm = rawRe.exec(html)) !== null) {
+      if (!seen.has(rm[0])) { seen.add(rm[0]); links.push({ href: rm[0], text: 'Stream Link' }); }
+    }
+    // Extract page title
+    const titleM = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+    const pageTitle = titleM ? titleM[1].trim() : '';
+    return { links, pageTitle };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -1105,7 +1096,8 @@ function parseListing(baseUrl, html, rootUrl, serverName) {
     prevEnd = anchorEnd;
 
     if (!href || href === '../' || href === './' || href === '/' || href.startsWith('?') || href.startsWith('#')) continue;
-    if (/^(mailto|javascript|ftp|data):/i.test(href)) continue;
+    // ftp:// links are valid media sources in the desktop app — don't skip them
+    if (/^(mailto|javascript|data):/i.test(href)) continue;
     if (NOISE_TEXT.has(anchorText.toLowerCase())) continue;
 
     let fullUrl;
@@ -1182,36 +1174,10 @@ async function pageTest(url) {
   }
 }
 
-/** One CORS-unlocking rule per configured host so <video crossorigin> capture works. */
+/**
+ * In Electron, CORS is managed by the session in main.ts (webRequest hooks)
+ * not via declarativeNetRequest. This is a no-op stub kept for compatibility.
+ */
 async function syncDynamicRules() {
-  const servers = await getServers();
-  const hosts = [];
-  for (const s of servers) {
-    try {
-      const h = new URL(s.url).hostname;
-      if (!hosts.includes(h)) hosts.push(h);
-    } catch (e) { /* skip invalid */ }
-  }
-  const existing = await chrome.declarativeNetRequest.getDynamicRules();
-  const addRules = hosts.map((host, i) => ({
-    id: 1000 + i,
-    priority: 2,
-    action: {
-      type: 'modifyHeaders',
-      responseHeaders: [
-        { header: 'Access-Control-Allow-Origin', operation: 'set', value: '*' },
-        { header: 'Access-Control-Allow-Methods', operation: 'set', value: 'GET, HEAD, OPTIONS' },
-        { header: 'Access-Control-Allow-Headers', operation: 'set', value: 'Range, Content-Type' },
-        { header: 'Access-Control-Expose-Headers', operation: 'set', value: 'Content-Length, Content-Range, Accept-Ranges' }
-      ]
-    },
-    condition: {
-      requestDomains: [host],
-      resourceTypes: ['media', 'xmlhttprequest', 'image', 'other']
-    }
-  }));
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: existing.map(r => r.id),
-    addRules
-  });
+  // No-op in Electron — CORS headers are injected by Electron's session module
 }
