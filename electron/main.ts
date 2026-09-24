@@ -229,6 +229,16 @@ function setupIpcHandlers() {
   });
 
   ipcMain.handle('shell:open-external', (_event, url) => shell.openExternal(url));
+  ipcMain.handle('shell:open-path', (_event, filePath) => shell.openPath(filePath));
+  ipcMain.handle('shell:show-item-in-folder', (_event, filePath) => { shell.showItemInFolder(filePath); });
+  ipcMain.handle('chrome:download', async (_event, opts) => {
+    // Use Electron's built-in download via webContents.downloadURL
+    const win = BrowserWindow.getFocusedWindow() || mainWindow;
+    if (win && !win.isDestroyed()) {
+      win.webContents.downloadURL(opts.url);
+    }
+    return true;
+  });
 }
 
 const gotTheLock = app.requestSingleInstanceLock();

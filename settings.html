@@ -22,7 +22,7 @@
   <section class="panel" id="addServerPanel">
     <h2>Add Server</h2>
     <p class="lead">Add an open directory, Emby/Jellyfin media server, or JS-rendered page. OmniStream can auto-detect the type or you can manually select it.</p>
-    <div class="note">Chrome dropped <code>ftp://</code> support, so enter the server's <strong>http://</strong> or <strong>https://</strong> address. OmniStream will ask for host permission if needed.</div>
+    <div class="note">Add an <strong>http://</strong>, <strong>https://</strong>, or <strong>ftp://</strong> server address. FTP servers are supported natively — OmniStream connects directly without any browser.</div>
     <form id="unifiedAddForm" style="margin-top:14px;">
       <div class="add-row" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <input class="input" id="unifiedAddInput" type="text" inputmode="url" placeholder="http://server.example.net/FILE/ or https://emby.example.com" autocomplete="off" spellcheck="false" aria-label="Server URL" style="flex:1; min-width:240px;">
@@ -104,7 +104,7 @@
       <div class="field">
         <label for="perHostConcurrency">Connections per host</label>
         <input class="input" type="number" id="perHostConcurrency" min="1" max="16" step="1">
-        <div class="help">Chrome only opens 6 HTTP/1.1 sockets per host, so going above 6 rarely helps.</div>
+        <div class="help">HTTP/1.1 opens 6 sockets per host by default, so going above 6 rarely helps for most servers.</div>
       </div>
       <div class="field">
         <label for="globalConcurrency">Total connections</label>

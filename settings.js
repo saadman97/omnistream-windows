@@ -1,11 +1,10 @@
 /*
  * settings.js — servers, crawler, thumbnail and library preferences.
- * Everything persists to chrome.storage.local; the service worker and the
- * library page react through storage.onChanged.
+ * Persists to chrome.storage.local (backed by Electron IPC to a JSON file).
+ * Fully self-contained — no Chrome extension runtime dependency.
  */
 'use strict';
 
-const HAS_EXT = typeof chrome !== 'undefined' && !!(chrome.runtime && chrome.runtime.id);
 const $ = id => document.getElementById(id);
 
 let servers = [];
@@ -15,8 +14,8 @@ const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'bas
 let serverFilter = '';
 let serverSortMode = 'name';
 let crawlRunning = false;
-let fileCounts = {};      // server_name (serverLabel) -> indexed file count
-let liveStatus = {};      // server_name -> { status, files, errors } while a crawl is running
+let fileCounts = {};      // server_name -> indexed file count
+let liveStatus = {};      // server_name -> { status, files, errors } while a crawl runs
 
 const NUMERIC = {
   perHostConcurrency: { min: 1, max: 16 },
@@ -32,12 +31,17 @@ const NUMERIC = {
 const BOOLEAN = ['thumbnailsEnabled', 'groupSeries', 'deepStreamResolveEnabled', 'deepStreamAllowExternalOneHop', 'deepStreamUnlimited'];
 
 async function init() {
-  if (!HAS_EXT) {
-    toast('Open this page from the extension to change settings.', { kind: 'err', sticky: true });
-    servers = DEFAULT_SERVERS.map(url => ({ url, enabled: true }));
-  } else {
+  try {
     settings = await getSettings();
+  } catch (e) {
+    console.warn('settings unavailable', e);
+    settings = { ...DEFAULT_SETTINGS };
+  }
+  try {
     servers = await getServers();
+  } catch (e) {
+    console.warn('servers unavailable', e);
+    servers = DEFAULT_SERVERS.map(url => ({ url, enabled: true }));
   }
   try { fileCounts = await dbCountFilesByServerAll(); } catch (e) { console.warn('file counts unavailable', e); }
   renderSettings();
@@ -47,27 +51,27 @@ async function init() {
   bind();
   refreshStats();
 
-  if (HAS_EXT) {
-    try {
-      const st = await chrome.runtime.sendMessage({ type: 'GET_CRAWL_STATE' });
-      setCrawlRunning(!!(st && st.running));
-      if (st && st.running && st.snapshot) applyLiveSnapshot(st.snapshot);
-    } catch (e) { /* worker not ready yet */ }
-    chrome.runtime.onMessage.addListener(async msg => {
-      if (!msg || !msg.type) return;
-      if (msg.type === 'CRAWL_START') { setCrawlRunning(true); liveStatus = {}; }
-      else if (msg.type === 'CRAWL_PROGRESS') { applyLiveSnapshot(msg.snapshot); }
-      else if (msg.type === 'CRAWL_COMPLETE' || msg.type === 'CRAWL_STOPPED') {
-        setCrawlRunning(false);
-        liveStatus = {};
-        try { fileCounts = await dbCountFilesByServerAll(); } catch (e) { /* ignore */ }
-        renderServers();
-        renderMediaServers();
-        renderPageServers();
-        refreshStats();
-      }
-    });
-  }
+  // Listen for crawl state changes from background
+  chrome.runtime.onMessage.addListener(async msg => {
+    if (!msg || !msg.type) return;
+    if (msg.type === 'CRAWL_START') { setCrawlRunning(true); liveStatus = {}; }
+    else if (msg.type === 'CRAWL_PROGRESS') { applyLiveSnapshot(msg.snapshot); }
+    else if (msg.type === 'CRAWL_COMPLETE' || msg.type === 'CRAWL_STOPPED') {
+      setCrawlRunning(false);
+      liveStatus = {};
+      try { fileCounts = await dbCountFilesByServerAll(); } catch (e) { /* ignore */ }
+      renderServers();
+      renderMediaServers();
+      renderPageServers();
+      refreshStats();
+    }
+  });
+
+  try {
+    const st = await chrome.runtime.sendMessage({ type: 'GET_CRAWL_STATE' });
+    setCrawlRunning(!!(st && st.running));
+    if (st && st.running && st.snapshot) applyLiveSnapshot(st.snapshot);
+  } catch (e) { /* worker not ready yet */ }
 }
 
 /** Reflects the crawler's live per-server progress into the settings page's server rows. */
@@ -87,9 +91,13 @@ function applyLiveSnapshot(snapshot) {
 function renderSettings() {
   for (const [key, spec] of Object.entries(NUMERIC)) {
     const el = $(key);
+    if (!el) continue;
     el.value = spec.scale ? Math.round(settings[key] / spec.scale) : settings[key];
   }
-  for (const key of BOOLEAN) $(key).checked = !!settings[key];
+  for (const key of BOOLEAN) {
+    const el = $(key);
+    if (el) el.checked = !!settings[key];
+  }
 }
 
 let saveTimer;
@@ -98,13 +106,12 @@ function scheduleSave(patch) {
   clearTimeout(saveTimer);
   setStatus('Saving…');
   saveTimer = setTimeout(async () => {
-    if (!HAS_EXT) return setStatus('Preview mode — nothing saved.');
     try { await saveSettings(settings); setStatus('Saved.'); }
     catch (e) { setStatus('Save failed: ' + e.message); }
   }, 350);
 }
 
-function setStatus(text) { $('saveStatus').textContent = text; }
+function setStatus(text) { const el = $('saveStatus'); if (el) el.textContent = text; }
 
 /* ------------------------------------------------------------------ */
 /* Servers                                                             */
@@ -133,7 +140,7 @@ function buildServerRow(s, opts) {
   lamp.dataset.state = live ? live.status : (s.enabled === false ? 'disabled' : count ? 'indexed' : 'unindexed');
   lamp.title = live ? `Crawling — ${live.status}` : (s.enabled === false ? 'Disabled' : count ? 'Indexed' : 'Not indexed yet');
   const url = document.createElement('div'); url.className = 'server-url'; url.textContent = opts.urlLabel(s); url.title = s.url;
-  url.style.minWidth = '0'; // flex child needs this or ellipsis never kicks in
+  url.style.minWidth = '0';
   urlRow.append(lamp, url);
 
   const sub = document.createElement('div'); sub.className = 'server-sub';
@@ -158,9 +165,11 @@ function buildServerRow(s, opts) {
 
 function renderServers() {
   const list = $('serverList');
+  if (!list) return;
   list.replaceChildren();
   const dirServers = servers.filter(s => s.type !== 'emby' && s.type !== 'page');
-  $('serverFilterWrap').classList.toggle('hidden', dirServers.length < 2);
+  const wrap = $('serverFilterWrap');
+  if (wrap) wrap.classList.toggle('hidden', dirServers.length < 2);
   if (!dirServers.length) {
     const d = document.createElement('div'); d.className = 'empty-list'; d.textContent = 'No servers yet. Add one above.';
     list.appendChild(d);
@@ -185,6 +194,7 @@ function renderServers() {
 
 function renderMediaServers() {
   const list = $('mediaServerList');
+  if (!list) return;
   list.replaceChildren();
   const mediaServers = servers.filter(s => s.type === 'emby');
   if (!mediaServers.length) {
@@ -217,38 +227,47 @@ function smallBtn(label, onClick, extra) {
 }
 
 async function persistServers() {
-  if (!HAS_EXT) return;
   await saveServers(servers);
   try { await chrome.runtime.sendMessage({ type: 'SYNC_RULES' }); } catch (e) { /* worker will sync on storage change */ }
+}
+
+/**
+ * Normalize any URL for use as a server address.
+ * Now accepts ftp:// natively — the media proxy handles it.
+ */
+function normalizeAnyServerUrl(input) {
+  const s = String(input || '').trim();
+  if (!s) return null;
+  // FTP URLs are valid in the desktop app
+  if (/^ftps?:\/\//i.test(s)) {
+    try { return new URL(s).href; } catch (e) { return null; }
+  }
+  return normalizeServerUrl(s);
 }
 
 async function addServer(raw, customName) {
   const input = String(raw || '').trim();
   if (!input) return;
-  if (/^ftp:\/\//i.test(input)) {
-    toast('Chrome cannot read ftp:// URLs. Use the server\'s http:// address instead.', { kind: 'err', ttl: 7000 });
-    return;
-  }
-  const url = normalizeServerUrl(input);
-  if (!url) { toast('That doesn\'t look like a valid http(s) URL.', { kind: 'err' }); return; }
-  if (servers.some(s => s.url === url)) { toast('That server is already in the list.'); return; }
 
-  if (HAS_EXT) {
-    let granted = false;
-    try {
-      granted = await requestOrigin(url);
-    } catch (e) {
-      console.warn('permission request failed', e);
+  // FTP is fully supported via the built-in proxy — never block it
+  const isFtp = /^ftps?:\/\//i.test(input);
+  let url;
+  if (isFtp) {
+    try { url = new URL(input).href; } catch (e) {
+      toast('That doesn\'t look like a valid ftp:// URL.', { kind: 'err' }); return;
     }
-    if (!granted) {
-      toast(`Added, but without permission to read ${new URL(url).host} the crawl will fail. Re-add to try again.`, { kind: 'err', ttl: 8000 });
-    }
+  } else {
+    url = normalizeServerUrl(input);
+    if (!url) { toast('That doesn\'t look like a valid http(s):// or ftp:// URL.', { kind: 'err' }); return; }
   }
+
+  if (servers.some(s => s.url === url)) { toast('That server is already in the list.'); return; }
 
   servers.push({ url, name: customName || undefined, enabled: true, addedAt: Date.now() });
   await persistServers();
   renderServers();
-  $('addInput').value = '';
+  const addInput = $('addInput');
+  if (addInput) addInput.value = '';
   toast('Server added. Run "Update index" in the library to crawl it.', { kind: 'ok' });
 }
 
@@ -259,21 +278,17 @@ async function addPageServer(raw, customName) {
   if (!url) { toast('That doesn\'t look like a valid http(s) URL.', { kind: 'err' }); return; }
   if (servers.some(s => s.url === url)) { toast('That address is already in your server list.'); return; }
 
-  if (HAS_EXT) {
-    let granted = false;
-    try { granted = await requestOrigin(url); } catch (e) { console.warn('permission request failed', e); }
-    if (!granted) toast(`Added, but without permission to read ${new URL(url).host} the crawl will fail. Re-add to try again.`, { kind: 'err', ttl: 8000 });
-  }
-
   servers.push({ url, name: customName || undefined, type: 'page', enabled: true, addedAt: Date.now() });
   await persistServers();
   renderPageServers();
-  $('pageAddInput').value = '';
+  const pageAddInput = $('pageAddInput');
+  if (pageAddInput) pageAddInput.value = '';
   toast('Page added. Run "Update index" in the library to scan it.', { kind: 'ok' });
 }
 
 function renderPageServers() {
   const list = $('pageServerList');
+  if (!list) return;
   list.replaceChildren();
   const pageServers = servers.filter(s => s.type === 'page');
   if (!pageServers.length) {
@@ -298,8 +313,7 @@ function renderPageServers() {
 }
 
 async function testPageServer(s, subEl) {
-  if (!HAS_EXT) return;
-  subEl.textContent = 'Opening a hidden tab to scan the page…'; subEl.className = 'server-sub';
+  subEl.textContent = 'Opening hidden tab to scan the page…'; subEl.className = 'server-sub';
   try {
     const r = await chrome.runtime.sendMessage({ type: 'PAGE_TEST', url: s.url });
     if (r && r.status === 'ok') {
@@ -311,23 +325,6 @@ async function testPageServer(s, subEl) {
     testResults.set(s.url, { ok: false, text: 'Failed: ' + e.message });
   }
   renderPageServers();
-}
-
-/** Ask for host access; falls back to a port-less pattern if Chrome rejects the first. */
-async function requestOrigin(url) {
-  const patterns = [originPattern(url)];
-  const u = new URL(url);
-  if (u.port) patterns.push(`${u.protocol}//${u.hostname}/*`);
-  let lastErr = null;
-  for (const origin of patterns) {
-    try {
-      if (await chrome.permissions.contains({ origins: [origin] })) return true;
-      if (await chrome.permissions.request({ origins: [origin] })) return true;
-      return false; // user declined
-    } catch (e) { lastErr = e; }
-  }
-  if (lastErr) throw lastErr;
-  return false;
 }
 
 async function editServer(s) {
@@ -344,25 +341,21 @@ async function editServer(s) {
     }
     return;
   }
-  
+
   let url;
   if (s.type === 'emby') {
     url = normalizeEmbyBaseUrl(newUrl);
   } else if (s.type === 'page') {
     url = normalizePageUrl(newUrl);
   } else {
-    url = normalizeServerUrl(newUrl);
+    url = normalizeAnyServerUrl(newUrl);
   }
-  
+
   if (!url) { toast('Invalid URL', { kind: 'err' }); return; }
-  
+
   if (servers.some(other => other !== s && other.url === url)) {
     toast('That address is already in your server list.', { kind: 'err' });
     return;
-  }
-  
-  if (HAS_EXT) {
-    try { await requestOrigin(url); } catch (e) { console.warn(e); }
   }
 
   s.url = url;
@@ -381,8 +374,6 @@ async function removeServer(s) {
   renderMediaServers();
   renderPageServers();
   try {
-    // A "page" source's cleanup scope is its origin (scraped media rarely lives at the page's own
-    // exact path) — everything else uses the server's own URL as its natural prefix.
     const cleanupPrefix = s.type === 'page' ? new URL(s.url).origin + '/' : undefined;
     const removed = await dbDeleteServer(s.url, cleanupPrefix);
     delete fileCounts[serverLabel(s.url)];
@@ -397,8 +388,29 @@ async function removeServer(s) {
 }
 
 async function testServer(s, subEl) {
-  if (!HAS_EXT) return;
   subEl.textContent = 'Testing…'; subEl.className = 'server-sub';
+
+  // FTP server test via Electron native FTP handler
+  if (/^ftps?:\/\//i.test(s.url)) {
+    if (window.electronAPI && window.electronAPI.testFtpServer) {
+      try {
+        const r = await window.electronAPI.testFtpServer(s.url);
+        if (r && r.status === 'ok') {
+          testResults.set(s.url, { ok: true, text: `OK · ${r.files} files, ${r.directories} folders at root · ${r.ms} ms` });
+        } else {
+          testResults.set(s.url, { ok: false, text: 'Failed: ' + ((r && r.message) || 'unknown error') });
+        }
+      } catch (e) {
+        testResults.set(s.url, { ok: false, text: 'Failed: ' + e.message });
+      }
+    } else {
+      testResults.set(s.url, { ok: false, text: 'FTP testing not available in this environment' });
+    }
+    renderServers();
+    return;
+  }
+
+  // HTTP server test via background crawler
   try {
     const r = await chrome.runtime.sendMessage({ type: 'TEST_SERVER', url: s.url });
     if (r && r.status === 'ok') {
@@ -413,7 +425,6 @@ async function testServer(s, subEl) {
 }
 
 async function testEmbyServer(s, subEl) {
-  if (!HAS_EXT) return;
   subEl.textContent = 'Testing…'; subEl.className = 'server-sub';
   try {
     const r = await chrome.runtime.sendMessage({ type: 'EMBY_TEST', server: s });
@@ -429,22 +440,23 @@ async function testEmbyServer(s, subEl) {
 }
 
 async function reindex(s) {
-  if (!HAS_EXT) return;
   try {
     const r = await chrome.runtime.sendMessage({ type: 'UPDATE_INDEX', servers: [s.url] });
-    if (r && r.status === 'started') toast(`Indexing ${serverLabel(s.url)} — open the library to watch progress.`, { kind: 'ok', action: 'Open library', onAction: () => chrome.runtime.sendMessage({ type: 'OPEN_BROWSER' }) });
+    if (r && r.status === 'started') toast(`Indexing ${serverLabel(s.url)} — open the library to watch progress.`, { kind: 'ok' });
     else if (r && r.status === 'busy') toast('Indexing is already running.');
     else toast((r && r.message) || 'Could not start indexing.', { kind: 'err' });
   } catch (e) { toast('Could not reach the background worker: ' + e.message, { kind: 'err' }); }
 }
 
 function exportServers() {
-  const blob = new Blob([JSON.stringify(servers.map(s => ({ url: s.url, enabled: s.enabled !== false })), null, 2)], { type: 'application/json' });
+  const data = JSON.stringify(servers.map(s => ({ url: s.url, name: s.name, type: s.type, enabled: s.enabled !== false })), null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'vault-servers.json';
+  a.download = 'omnistream-servers.json';
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  toast('Server list exported.', { kind: 'ok' });
 }
 
 async function importServers(file) {
@@ -454,47 +466,32 @@ async function importServers(file) {
     const parsed = JSON.parse(text);
     entries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.servers) ? parsed.servers : []);
   } catch (e) {
+    // Try plain text line-by-line
     entries = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   }
   let added = 0;
-  const fresh = [];
   for (const e of entries) {
-    const url = normalizeServerUrl(typeof e === 'string' ? e : e && e.url);
+    const rawUrl = typeof e === 'string' ? e : (e && e.url);
+    // Accept ftp, http, https
+    const url = /^ftps?:\/\//i.test(rawUrl || '')
+      ? (() => { try { return new URL(rawUrl).href; } catch(ex) { return null; } })()
+      : normalizeServerUrl(rawUrl);
     if (!url || servers.some(s => s.url === url)) continue;
-    servers.push({ url, enabled: typeof e === 'object' && e ? e.enabled !== false : true, addedAt: Date.now() });
-    fresh.push(url);
+    servers.push({
+      url,
+      name: (typeof e === 'object' && e && e.name) ? e.name : undefined,
+      type: (typeof e === 'object' && e && e.type) ? e.type : undefined,
+      enabled: typeof e === 'object' && e ? e.enabled !== false : true,
+      addedAt: Date.now()
+    });
     added++;
   }
   await persistServers();
   renderServers();
+  renderMediaServers();
+  renderPageServers();
   if (!added) { toast('Nothing new to import.'); return; }
-
-  // permissions.request needs a user gesture, and the file-dialog round trip has consumed it.
-  // Offer the grant as a click instead of silently failing.
-  const missing = HAS_EXT ? await missingOrigins(fresh) : [];
-  if (missing.length) {
-    toast(`Imported ${added}. ${missing.length} host${missing.length === 1 ? '' : 's'} still need read access.`, {
-      kind: 'err', sticky: true, action: 'Grant access',
-      onAction: async () => {
-        let ok = false;
-        try { ok = await chrome.permissions.request({ origins: missing }); }
-        catch (e) { try { ok = await chrome.permissions.request({ origins: missing.map(o => o.replace(/:\d+\/\*$/, '/*')) }); } catch (e2) { /* ignore */ } }
-        toast(ok ? 'Access granted.' : 'Access was not granted — crawling those hosts will fail.', { kind: ok ? 'ok' : 'err' });
-      }
-    });
-  } else {
-    toast(`Imported ${added} new server${added === 1 ? '' : 's'}.`, { kind: 'ok' });
-  }
-}
-
-async function missingOrigins(urls) {
-  const out = [];
-  for (const url of [...new Set(urls)]) {
-    const origin = originPattern(url);
-    try { if (!(await chrome.permissions.contains({ origins: [origin] }))) out.push(origin); }
-    catch (e) { out.push(origin); }
-  }
-  return [...new Set(out)];
+  toast(`Imported ${added} new server${added === 1 ? '' : 's'}.`, { kind: 'ok' });
 }
 
 /* ------------------------------------------------------------------ */
@@ -514,30 +511,37 @@ async function refreshStats() {
     }
   } catch (e) {
     console.warn('stats failed', e);
-    for (const id of ['statFiles', 'statThumbs', 'statFavorites', 'statStorage', 'statIndexed']) $(id).textContent = 'unavailable';
+    for (const id of ['statFiles', 'statThumbs', 'statFavorites', 'statStorage', 'statIndexed']) {
+      const el = $(id);
+      if (el) el.textContent = 'unavailable';
+    }
   }
 }
 
-/** Crawling and clearing the same store at once can race; keep the destructive buttons off while a crawl runs. */
+/** Keep destructive buttons off while a crawl runs to prevent races. */
 function setCrawlRunning(running) {
   crawlRunning = running;
   for (const id of ['clearThumbsBtn', 'clearIndexBtn']) {
     const b = $(id);
+    if (!b) continue;
     b.disabled = running;
     b.title = running ? 'Wait for the current crawl to finish first.' : '';
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* Auto-Detection & Server Addition                                   */
+/* Auto-Detection & Server Addition                                    */
 /* ------------------------------------------------------------------ */
 
 let embyAuthMode = 'password';
 
 async function detectServerType(rawUrl, username, password, apiKey) {
   if (!rawUrl) return 'dir';
-  
-  // 1. Check credentials or explicit URL signature patterns
+
+  // FTP URLs are always "dir" type — handled by the native proxy
+  if (/^ftps?:\/\//i.test(rawUrl)) return 'dir';
+
+  // Check credentials or explicit URL signature patterns
   if (username || password || apiKey) return 'emby';
   const urlLower = rawUrl.toLowerCase();
   if (urlLower.includes('/emby') || urlLower.includes('/jellyfin') || /:8096|:8920/.test(urlLower)) {
@@ -547,7 +551,7 @@ async function detectServerType(rawUrl, username, password, apiKey) {
     return 'page';
   }
 
-  // 2. Probe test: Check if Emby / Jellyfin API responds
+  // Probe test: Check if Emby / Jellyfin API responds
   try {
     const embyBase = normalizeEmbyBaseUrl(rawUrl);
     if (embyBase) {
@@ -565,32 +569,13 @@ async function detectServerType(rawUrl, username, password, apiKey) {
     }
   } catch (e) { /* Not Emby */ }
 
-  // 3. Probe test: Check if root page renders as a JS / SPA page vs open directory
-  try {
-    const normPage = normalizePageUrl(rawUrl);
-    if (normPage) {
-      const ctrl = new AbortController();
-      const tid = setTimeout(() => ctrl.abort(), 3500);
-      const res = await fetch(normPage, { method: 'GET', signal: ctrl.signal, headers: { Range: 'bytes=0-2048' } });
-      clearTimeout(tid);
-      if (res.ok) {
-        const html = (await res.text()).toLowerCase();
-        if (html.includes('<app-root') || html.includes('id="root"') || html.includes('id="app"') || html.includes('single-page-app')) {
-          return 'page';
-        }
-      }
-    }
-  } catch (e) { /* Ignore fetch errors */ }
-
-  // 4. Default fallback: Open Directory
   return 'dir';
 }
 
 async function handleAddEmbyServer(rawUrl, username, password, apiKey, customName) {
-  if (!HAS_EXT) { toast('Open this page from the extension to add a media server.', { kind: 'err' }); return; }
   const url = normalizeEmbyBaseUrl(rawUrl);
   if (!url) { toast('Invalid Media Server URL.', { kind: 'err' }); return; }
-  
+
   if (embyAuthMode === 'password' && (username || password)) {
     if (!username || !password) { toast('Enter both username and password.', { kind: 'err' }); return; }
   } else if (embyAuthMode === 'apikey' && !apiKey) {
@@ -600,8 +585,15 @@ async function handleAddEmbyServer(rawUrl, username, password, apiKey, customNam
   const payload = (apiKey || embyAuthMode === 'apikey')
     ? { type: 'EMBY_AUTH', url, apiKey, username }
     : { type: 'EMBY_AUTH', url, username, password };
-    
-  const res = await chrome.runtime.sendMessage(payload);
+
+  let res;
+  try {
+    res = await chrome.runtime.sendMessage(payload);
+  } catch (e) {
+    toast('Could not connect to Media Server: ' + e.message, { kind: 'err' });
+    return;
+  }
+
   if (!res || res.status !== 'ok') {
     toast((res && res.message) || 'Could not connect to Media Server.', { kind: 'err' });
     return;
@@ -610,10 +602,6 @@ async function handleAddEmbyServer(rawUrl, username, password, apiKey, customNam
     toast('That media server is already in your server list.');
     return;
   }
-
-  let granted = false;
-  try { granted = await requestOrigin(res.url); } catch (e) { /* ignore */ }
-  if (!granted) toast(`Connected, but without permission to reach ${new URL(res.url).host} indexing will fail. Re-add to try again.`, { kind: 'err', ttl: 8000 });
 
   servers.push({
     url: res.url, type: 'emby', enabled: true,
@@ -634,26 +622,16 @@ async function handleAddEmbyServer(rawUrl, username, password, apiKey, customNam
 function bind() {
   const backBtn = $('backBtn');
   if (backBtn) {
-    backBtn.addEventListener('click', async (e) => {
+    backBtn.addEventListener('click', e => {
       e.preventDefault();
-      if (window.electronAPI) {
-        window.electronAPI.openBrowser();
-        window.close();
-      } else if (HAS_EXT) {
-        try {
-          await chrome.runtime.sendMessage({ type: 'OPEN_BROWSER' });
-          window.close();
-        } catch (err) {
-          window.location.href = 'browser.html';
-        }
-      } else {
-        window.location.href = 'browser.html';
-      }
+      window.location.href = 'browser.html';
     });
   }
 
   for (const [key, spec] of Object.entries(NUMERIC)) {
-    $(key).addEventListener('change', e => {
+    const el = $(key);
+    if (!el) continue;
+    el.addEventListener('change', e => {
       let v = parseInt(e.target.value, 10);
       if (!isFinite(v)) v = spec.scale ? DEFAULT_SETTINGS[key] / spec.scale : DEFAULT_SETTINGS[key];
       v = Math.min(spec.max, Math.max(spec.min, v));
@@ -661,112 +639,188 @@ function bind() {
       scheduleSave({ [key]: spec.scale ? v * spec.scale : v });
     });
   }
-  for (const key of BOOLEAN) $(key).addEventListener('change', e => scheduleSave({ [key]: e.target.checked }));
+  for (const key of BOOLEAN) {
+    const el = $(key);
+    if (el) el.addEventListener('change', e => scheduleSave({ [key]: e.target.checked }));
+  }
 
   // Emby Credentials toggle (Password vs API Key)
-  $('embyToggleAuthBtn').addEventListener('click', () => {
-    embyAuthMode = embyAuthMode === 'password' ? 'apikey' : 'password';
-    $('embyPassField').classList.toggle('hidden', embyAuthMode === 'apikey');
-    $('embyKeyField').classList.toggle('hidden', embyAuthMode === 'password');
-    $('embyToggleAuthBtn').textContent = embyAuthMode === 'apikey' ? 'Use username & password instead' : 'Use an API key instead';
-  });
+  const embyToggleAuthBtn = $('embyToggleAuthBtn');
+  if (embyToggleAuthBtn) {
+    embyToggleAuthBtn.addEventListener('click', () => {
+      embyAuthMode = embyAuthMode === 'password' ? 'apikey' : 'password';
+      const embyPassField = $('embyPassField');
+      const embyKeyField = $('embyKeyField');
+      if (embyPassField) embyPassField.classList.toggle('hidden', embyAuthMode === 'apikey');
+      if (embyKeyField) embyKeyField.classList.toggle('hidden', embyAuthMode === 'password');
+      embyToggleAuthBtn.textContent = embyAuthMode === 'apikey' ? 'Use username & password instead' : 'Use an API key instead';
+    });
+  }
 
   // Credentials Panel visibility toggle
-  $('unifiedAuthToggleBtn').addEventListener('click', () => {
-    $('unifiedAuthSection').classList.toggle('hidden');
-  });
+  const unifiedAuthToggleBtn = $('unifiedAuthToggleBtn');
+  if (unifiedAuthToggleBtn) {
+    unifiedAuthToggleBtn.addEventListener('click', () => {
+      const sec = $('unifiedAuthSection');
+      if (sec) sec.classList.toggle('hidden');
+    });
+  }
 
   // Auto-expand credentials panel if user explicitly chooses Media Server
-  $('unifiedServerType').addEventListener('change', e => {
-    if (e.target.value === 'emby') {
-      $('unifiedAuthSection').classList.remove('hidden');
-    }
-  });
+  const unifiedServerType = $('unifiedServerType');
+  if (unifiedServerType) {
+    unifiedServerType.addEventListener('change', e => {
+      if (e.target.value === 'emby') {
+        const sec = $('unifiedAuthSection');
+        if (sec) sec.classList.remove('hidden');
+      }
+    });
+  }
 
   // Unified Server Add Handler
-  $('unifiedAddForm').addEventListener('submit', async e => {
-    e.preventDefault();
-    const rawUrl = $('unifiedAddInput').value.trim();
-    if (!rawUrl) { toast('Enter a server address.', { kind: 'err' }); return; }
-    
-    const typeChoice = $('unifiedServerType').value;
-    const customName = $('unifiedNameInput').value.trim();
-    const username = $('embyUsername').value.trim();
-    const password = $('embyPassword').value;
-    const apiKey = $('embyApiKey').value.trim();
-    
-    const btn = $('unifiedAddBtn');
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = typeChoice === 'auto' ? 'Detecting…' : 'Adding…';
-    
-    try {
-      let type = typeChoice;
-      if (type === 'auto') {
-        type = await detectServerType(rawUrl, username, password, apiKey);
-      }
-      
-      if (type === 'emby') {
-        await handleAddEmbyServer(rawUrl, username, password, apiKey, customName);
-      } else if (type === 'page') {
-        await addPageServer(rawUrl, customName);
-      } else {
-        await addServer(rawUrl, customName);
-      }
-      $('unifiedAddInput').value = '';
-      $('unifiedNameInput').value = '';
-    } catch (err) {
-      toast('Failed to add server: ' + err.message, { kind: 'err' });
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
-  });
+  const unifiedAddForm = $('unifiedAddForm');
+  if (unifiedAddForm) {
+    unifiedAddForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const rawUrl = $('unifiedAddInput').value.trim();
+      if (!rawUrl) { toast('Enter a server address.', { kind: 'err' }); return; }
 
-  let filterTimer;
-  $('serverFilterInput').addEventListener('input', e => {
-    clearTimeout(filterTimer);
-    filterTimer = setTimeout(() => { serverFilter = e.target.value; renderServers(); }, 120);
-  });
-  $('serverSortSelect').addEventListener('change', e => {
-    serverSortMode = e.target.value;
-    renderServers();
-    renderMediaServers();
-    renderPageServers();
-  });
-  $('enableAllBtn').addEventListener('click', async () => { servers.forEach(s => s.enabled = true); await persistServers(); renderServers(); });
-  $('disableAllBtn').addEventListener('click', async () => { servers.forEach(s => s.enabled = false); await persistServers(); renderServers(); });
-  $('exportBtn').addEventListener('click', exportServers);
-  $('importBtn').addEventListener('click', () => $('importFile').click());
-  $('importFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) importServers(f); e.target.value = ''; });
-  $('restoreBtn').addEventListener('click', async () => {
-    if (!confirm('Replace the server list with the built-in defaults?')) return;
-    servers = DEFAULT_SERVERS.map(url => ({ url, enabled: true }));
-    await persistServers(); renderServers();
-  });
+      const typeChoice = $('unifiedServerType').value;
+      const customName = $('unifiedNameInput').value.trim();
+      const username = $('embyUsername') ? $('embyUsername').value.trim() : '';
+      const password = $('embyPassword') ? $('embyPassword').value : '';
+      const apiKey = $('embyApiKey') ? $('embyApiKey').value.trim() : '';
 
-  $('clearThumbsBtn').addEventListener('click', async () => {
-    if (crawlRunning) return;
-    try { await dbClearThumbs(); toast('Thumbnail cache cleared.', { kind: 'ok' }); refreshStats(); }
-    catch (e) { toast('Could not clear thumbnails: ' + e.message, { kind: 'err' }); }
-  });
-  $('clearFavoritesBtn').addEventListener('click', async () => {
-    if (!confirm('Remove every favorite? This cannot be undone.')) return;
-    try { await dbClearFavorites(); toast('Favorites cleared.', { kind: 'ok' }); refreshStats(); }
-    catch (e) { toast('Could not clear favorites: ' + e.message, { kind: 'err' }); }
-  });
-  $('clearIndexBtn').addEventListener('click', async () => {
-    if (crawlRunning) return;
-    if (!confirm('Delete every indexed file? Your server list is kept.')) return;
-    try { await dbClearFiles(); await dbSetMeta('lastIndexed', null); fileCounts = {}; renderServers(); toast('Index cleared.', { kind: 'ok' }); refreshStats(); }
-    catch (e) { toast('Could not clear the index: ' + e.message, { kind: 'err' }); }
-  });
-  $('discardResumeBtn').addEventListener('click', async () => {
-    if (!HAS_EXT) return;
-    if (!confirm('Discard the interrupted crawl? Its progress will be lost.')) return;
-    try { await chrome.runtime.sendMessage({ type: 'DISCARD_RESUME' }); toast('Interrupted crawl discarded.', { kind: 'ok' }); }
-    catch (e) { toast('Could not reach the background worker: ' + e.message, { kind: 'err' }); }
-  });
+      const btn = $('unifiedAddBtn');
+      btn.disabled = true;
+      const origText = btn.textContent;
+      btn.textContent = typeChoice === 'auto' ? 'Detecting…' : 'Adding…';
+
+      try {
+        let type = typeChoice;
+        if (type === 'auto') {
+          type = await detectServerType(rawUrl, username, password, apiKey);
+        }
+
+        if (type === 'emby') {
+          await handleAddEmbyServer(rawUrl, username, password, apiKey, customName);
+        } else if (type === 'page') {
+          await addPageServer(rawUrl, customName);
+        } else {
+          await addServer(rawUrl, customName);
+        }
+        $('unifiedAddInput').value = '';
+        $('unifiedNameInput').value = '';
+      } catch (err) {
+        toast('Failed to add server: ' + err.message, { kind: 'err' });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+  }
+
+  const serverFilterInput = $('serverFilterInput');
+  if (serverFilterInput) {
+    let filterTimer;
+    serverFilterInput.addEventListener('input', e => {
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => { serverFilter = e.target.value; renderServers(); }, 120);
+    });
+  }
+
+  const serverSortSelect = $('serverSortSelect');
+  if (serverSortSelect) {
+    serverSortSelect.addEventListener('change', e => {
+      serverSortMode = e.target.value;
+      renderServers();
+      renderMediaServers();
+      renderPageServers();
+    });
+  }
+
+  const enableAllBtn = $('enableAllBtn');
+  if (enableAllBtn) enableAllBtn.addEventListener('click', async () => { servers.forEach(s => s.enabled = true); await persistServers(); renderServers(); renderMediaServers(); renderPageServers(); });
+
+  const disableAllBtn = $('disableAllBtn');
+  if (disableAllBtn) disableAllBtn.addEventListener('click', async () => { servers.forEach(s => s.enabled = false); await persistServers(); renderServers(); renderMediaServers(); renderPageServers(); });
+
+  const exportBtn = $('exportBtn');
+  if (exportBtn) exportBtn.addEventListener('click', exportServers);
+
+  const importBtn = $('importBtn');
+  const importFile = $('importFile');
+  if (importBtn && importFile) {
+    importBtn.addEventListener('click', () => importFile.click());
+    importFile.addEventListener('change', e => {
+      const f = e.target.files[0];
+      if (f) importServers(f);
+      e.target.value = '';
+    });
+  }
+
+  const restoreBtn = $('restoreBtn');
+  if (restoreBtn) {
+    restoreBtn.addEventListener('click', async () => {
+      if (!confirm('Replace the server list with the built-in defaults?')) return;
+      servers = DEFAULT_SERVERS.map(url => ({ url, enabled: true }));
+      await persistServers();
+      renderServers();
+      renderMediaServers();
+      renderPageServers();
+      toast('Server list restored to defaults.', { kind: 'ok' });
+    });
+  }
+
+  const clearThumbsBtn = $('clearThumbsBtn');
+  if (clearThumbsBtn) {
+    clearThumbsBtn.addEventListener('click', async () => {
+      if (crawlRunning) return;
+      try { await dbClearThumbs(); toast('Thumbnail cache cleared.', { kind: 'ok' }); refreshStats(); }
+      catch (e) { toast('Could not clear thumbnails: ' + e.message, { kind: 'err' }); }
+    });
+  }
+
+  const clearFavoritesBtn = $('clearFavoritesBtn');
+  if (clearFavoritesBtn) {
+    clearFavoritesBtn.addEventListener('click', async () => {
+      if (!confirm('Remove every favorite? This cannot be undone.')) return;
+      try { await dbClearFavorites(); toast('Favorites cleared.', { kind: 'ok' }); refreshStats(); }
+      catch (e) { toast('Could not clear favorites: ' + e.message, { kind: 'err' }); }
+    });
+  }
+
+  const clearIndexBtn = $('clearIndexBtn');
+  if (clearIndexBtn) {
+    clearIndexBtn.addEventListener('click', async () => {
+      if (crawlRunning) return;
+      if (!confirm('Delete every indexed file? Your server list is kept.')) return;
+      try {
+        await dbClearFiles();
+        await dbSetMeta('lastIndexed', null);
+        fileCounts = {};
+        renderServers();
+        renderMediaServers();
+        renderPageServers();
+        toast('Index cleared.', { kind: 'ok' });
+        refreshStats();
+      }
+      catch (e) { toast('Could not clear the index: ' + e.message, { kind: 'err' }); }
+    });
+  }
+
+  const discardResumeBtn = $('discardResumeBtn');
+  if (discardResumeBtn) {
+    discardResumeBtn.addEventListener('click', async () => {
+      if (!confirm('Discard the interrupted crawl? Its progress will be lost.')) return;
+      try {
+        await chrome.runtime.sendMessage({ type: 'DISCARD_RESUME' });
+        toast('Interrupted crawl discarded.', { kind: 'ok' });
+      } catch (e) {
+        toast('Could not reach the background worker: ' + e.message, { kind: 'err' });
+      }
+    });
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -775,6 +829,7 @@ function bind() {
 
 function toast(text, opts = {}) {
   const host = $('toasts');
+  if (!host) { console.warn('[toast]', text); return; }
   const t = document.createElement('div');
   t.className = 'toast' + (opts.kind ? ' ' + opts.kind : '');
   const span = document.createElement('span'); span.textContent = text;

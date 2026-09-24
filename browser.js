@@ -91,15 +91,10 @@ const ICONS = {
 
 async function init() {
   restoreUiState();
-  if (HAS_EXT) {
-    try {
-      state.settings = await getSettings();
-      state.servers = await getServers();
-    } catch (e) { console.warn('settings unavailable', e); }
-  } else {
-    state.servers = DEFAULT_SERVERS.map(url => ({ url, enabled: true }));
-    els.brandSub.textContent = 'preview mode · no extension APIs';
-  }
+  try {
+    state.settings = await getSettings();
+    state.servers = await getServers();
+  } catch (e) { console.warn('settings unavailable', e); }
   els.sortSelect.value = state.sort;
   setView(state.view, false);
   bindEvents();
@@ -108,20 +103,19 @@ async function init() {
   try { state.favorites = await dbGetFavoriteUrls(); } catch (e) { console.warn('favorites unavailable', e); }
   await loadLibrary();
 
-  if (HAS_EXT) {
-    chrome.runtime.onMessage.addListener(onCrawlMessage);
-    try {
-      const st = await send({ type: 'GET_CRAWL_STATE' });
-      if (st && st.running) onCrawlStart(st.snapshot, false);
-      else if (st && st.resumable) {
-        const info = st.resumeInfo || {};
-        toast(`An interrupted crawl can be resumed (${formatNumber(info.queued)} folders left).`, {
-          action: 'Resume', onAction: () => startCrawl({ resume: true }), sticky: true,
-          secondary: 'Discard', onSecondary: () => send({ type: 'DISCARD_RESUME' })
-        });
-      }
-    } catch (e) { /* worker not ready */ }
-  }
+  // Always register message listener (works via IPC shim in Electron)
+  chrome.runtime.onMessage.addListener(onCrawlMessage);
+  try {
+    const st = await send({ type: 'GET_CRAWL_STATE' });
+    if (st && st.running) onCrawlStart(st.snapshot, false);
+    else if (st && st.resumable) {
+      const info = st.resumeInfo || {};
+      toast(`An interrupted crawl can be resumed (${formatNumber(info.queued)} folders left).`, {
+        action: 'Resume', onAction: () => startCrawl({ resume: true }), sticky: true,
+        secondary: 'Discard', onSecondary: () => send({ type: 'DISCARD_RESUME' })
+      });
+    }
+  } catch (e) { /* worker not ready */ }
 }
 
 function restoreUiState() {
@@ -559,7 +553,7 @@ function renderEmpty() {
     if (noServers) {
       els.emptyTitle.textContent = 'No servers configured';
       els.emptyText.textContent = 'Add an open directory in Settings to get started.';
-      const a = document.createElement('a'); a.className = 'btn btn-primary'; a.href = 'settings.html'; a.textContent = 'Add a server';
+      const a = button('Add a server', () => { window.location.href = 'settings.html'; }, 'btn btn-primary');
       els.emptyActions.appendChild(a);
     } else {
       els.emptyTitle.textContent = state.crawling ? 'Indexing…' : 'Nothing indexed yet';
@@ -568,7 +562,7 @@ function renderEmpty() {
         : 'Crawl your servers once and every file becomes searchable here.';
       if (!state.crawling) {
         els.emptyActions.appendChild(button('Update index', () => startCrawl(), 'btn btn-primary'));
-        const a = document.createElement('a'); a.className = 'btn'; a.href = 'settings.html'; a.textContent = 'Manage servers';
+        const a = button('Manage servers', () => { window.location.href = 'settings.html'; }, 'btn');
         els.emptyActions.appendChild(a);
       }
     }
@@ -663,7 +657,7 @@ function buildActions(f, container, node) {
   } else {
     if (f.file_type_category === 'Video' && PLAYABLE_EXT.has(f.ext)) container.appendChild(add('Play', ICONS.play, () => play(f, f.parent_url)));
     container.appendChild(add('Copy link', ICONS.link, () => copy(f.full_url)));
-    container.appendChild(HAS_EXT && chrome.downloads ? add('Download', ICONS.download, () => download(f)) : add('Download', ICONS.download, null, routeUrl(f.full_url)));
+    container.appendChild(add('Download', ICONS.download, () => download(f)));
     container.appendChild(add('Open folder on server', ICONS.open, null, routeUrl(f.parent_url)));
   }
 }
@@ -676,7 +670,12 @@ function routeUrl(url) {
 function primaryAction(f) {
   if (f.type === 'Folder') return openFolder(f);
   if (f.file_type_category === 'Video' && PLAYABLE_EXT.has(f.ext)) return play(f, f.parent_url);
-  window.open(routeUrl(f.full_url), '_blank', 'noopener');
+  // Open in default system browser instead of new window
+  if (window.electronAPI && window.electronAPI.openExternal) {
+    window.electronAPI.openExternal(routeUrl(f.full_url));
+  } else {
+    window.location.href = routeUrl(f.full_url);
+  }
 }
 
 function primaryLabel(f) {
@@ -898,7 +897,13 @@ async function renderSideFoot() {
   els.sideFoot.replaceChildren();
   els.sideFoot.append(`${formatNumber(state.all.length)} files · ${formatNumber(thumbCount)} thumbnails`);
   els.sideFoot.appendChild(document.createElement('br'));
-  const a = document.createElement('a'); a.href = 'settings.html'; a.textContent = 'settings';
+  const a = button('settings', () => { window.location.href = 'settings.html'; }, '');
+  a.style.background = 'none';
+  a.style.border = 'none';
+  a.style.color = 'var(--text-muted, #888)';
+  a.style.cursor = 'pointer';
+  a.style.padding = '0';
+  a.style.textDecoration = 'underline';
   els.sideFoot.appendChild(a);
 }
 
@@ -1055,10 +1060,16 @@ function bindFilterPanel() {
 
 async function download(f) {
   try {
-    await chrome.downloads.download({ url: routeUrl(f.full_url), filename: f.filename.replace(/[\\/:*?"<>|]/g, '_'), conflictAction: 'uniquify' });
+    // Use native Electron download via IPC
+    await chrome.downloads.download({ url: routeUrl(f.full_url), filename: f.filename.replace(/[\\\/:*?"<>|]/g, '_'), conflictAction: 'uniquify' });
     toast(`Downloading ${f.filename}`, { kind: 'ok', ttl: 2500 });
   } catch (e) {
-    toast('Download failed: ' + e.message, { kind: 'err' });
+    // Fallback: open in system browser
+    if (window.electronAPI && window.electronAPI.openExternal) {
+      window.electronAPI.openExternal(routeUrl(f.full_url));
+    } else {
+      toast('Download failed: ' + e.message, { kind: 'err' });
+    }
   }
 }
 
@@ -1134,7 +1145,7 @@ function bindEvents() {
   
   els.liveStreamBtn.addEventListener('click', () => {
     const url = prompt('Enter a live stream URL (M3U8, DASH, etc.):');
-    if (url) window.open('player.html?src=' + encodeURIComponent(url));
+    if (url && url.trim()) window.location.href = 'player.html?src=' + encodeURIComponent(url.trim());
   });
 
   els.importPlaylistBtn.addEventListener('click', () => els.playlistFileInput.click());
@@ -1204,13 +1215,12 @@ function bindEvents() {
     if (e.key === 'Backspace' && state.folder) exitFolder();
   });
 
-  if (HAS_EXT) {
-    chrome.storage.onChanged.addListener(async (changes, area) => {
-      if (area !== 'local') return;
-      if (changes.settings) { state.settings = { ...DEFAULT_SETTINGS, ...changes.settings.newValue }; applyFilters(); }
-      if (changes.servers) { state.servers = changes.servers.newValue || []; renderRack(); }
-    });
-  }
+  // Always register storage change listener (works via IPC shim in Electron)
+  chrome.storage.onChanged.addListener(async (changes, area) => {
+    if (area !== 'local') return;
+    if (changes.settings) { state.settings = { ...DEFAULT_SETTINGS, ...changes.settings.newValue }; applyFilters(); }
+    if (changes.servers) { state.servers = changes.servers.newValue || []; renderRack(); }
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1218,7 +1228,6 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 
 async function startCrawl(opts = {}) {
-  if (!HAS_EXT) { toast('Indexing needs the extension runtime — load this page from the extension.', { kind: 'err' }); return; }
   els.updateBtn.disabled = true;
   try {
     const res = await send({ type: 'UPDATE_INDEX', ...opts });
@@ -1226,7 +1235,8 @@ async function startCrawl(opts = {}) {
       toast((res && res.message) || 'Could not start indexing', { kind: 'err' });
       els.updateBtn.disabled = false;
     } else if (res.status === 'busy') {
-      toast('Indexing is already running');
+      toast('Indexing is already running.');
+      els.updateBtn.disabled = false;
     }
   } catch (e) {
     toast('Background worker not responding: ' + e.message, { kind: 'err' });

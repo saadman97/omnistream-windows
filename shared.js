@@ -35,7 +35,7 @@ const DEFAULT_SERVERS = [
 
 const DEFAULT_SETTINGS = {
   // Crawler
-  perHostConcurrency: 6,     // Chrome caps HTTP/1.1 at 6 sockets per host anyway
+  perHostConcurrency: 6,     // HTTP/1.1 supports ~6 sockets per host by default
   globalConcurrency: 64,
   requestTimeoutMs: 20000,
   retries: 2,
@@ -59,8 +59,9 @@ const DEFAULT_SETTINGS = {
 const VIDEO_EXT = new Set(['mkv', 'mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', 'ts', 'mpg', 'mpeg', '3gp', 'ogv', 'm3u8', 'mpd']);
 const AUDIO_EXT = new Set(['mp3', 'flac', 'wav', 'aac', 'ogg', 'm4a', 'opus', 'wma']);
 const IMAGE_EXT = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif', 'svg']);
-// Containers Chrome can realistically decode in a <video> element (or via HLS stream URL).
-const PLAYABLE_EXT = new Set(['mp4', 'webm', 'mkv', 'm4v', 'mov', 'ogv', 'm3u8', 'mpd']);
+// Containers this app can realistically decode in a <video> element (or via HLS stream URL).
+// All other formats are transcoded on-the-fly by the ffmpeg media proxy.
+const PLAYABLE_EXT = new Set(['mp4', 'webm', 'mkv', 'm4v', 'mov', 'ogv', 'm3u8', 'mpd', 'avi', 'ts', 'wmv', 'flv', 'mpeg', 'mpg']);
 
 const SERIES_RE = /\b(s\d{1,2}\s?e\d{1,3}|season[\s._-]*\d+|episode[\s._-]*\d+|\bep[\s._-]*\d{1,3})\b/i;
 const STREAM_LINK_RE = /\.(m3u8|mpd|mp4|mkv|webm|avi|mov|wmv|flv|m4v|ts|mpg|mpeg)(?:[?#]|$)/i;
@@ -95,13 +96,18 @@ async function saveServers(servers) {
   return servers;
 }
 
-/** Normalise a user-entered directory URL. Returns null if unusable. */
+/** Normalise a user-entered directory URL. Returns null if unusable.
+ *  Accepts http://, https://, and ftp:// (native desktop support via media proxy). */
 function normalizeServerUrl(input) {
   let s = String(input || '').trim();
   if (!s) return null;
   if (!/^[a-z]+:\/\//i.test(s)) s = 'http://' + s;
   let u;
   try { u = new URL(s); } catch (e) { return null; }
+  // Allow ftp and ftps natively on desktop
+  if (u.protocol === 'ftp:' || u.protocol === 'ftps:') {
+    return u.href;
+  }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
   u.hash = '';
   u.search = '';
