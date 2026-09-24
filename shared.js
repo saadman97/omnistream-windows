@@ -1,7 +1,4 @@
-if (typeof chrome === 'undefined') { window.chrome = {}; }
-if (!chrome.storage) { chrome.storage = { local: window.electronAPI.storage }; }
-if (!chrome.runtime) { chrome.runtime = { sendMessage: window.electronAPI.runtime.sendMessage, onMessage: { addListener: window.electronAPI.runtime.onMessage } }; }
-if (!chrome.tabs) { chrome.tabs = { create: async (opts) => { window.location.href = opts.url; } }; }
+
 /*
  * shared.js — constants, settings and IndexedDB helpers shared by the
  * service worker (via importScripts) and the extension pages (via <script>).

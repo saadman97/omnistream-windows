@@ -2,10 +2,13 @@ import { app, BrowserWindow, ipcMain, shell, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { testFtpServer, listFtpDirectory } from './ftp-service';
+import { startMediaServer } from './media-server';
 
 const isDev = process.env.NODE_ENV === 'development';
 let mainWindow: BrowserWindow | null = null;
 let backgroundWindow: BrowserWindow | null = null;
+let proxyInfo: any = null;
 
 // Persistent storage file in app userData
 const storageFile = path.join(app.getPath('userData'), 'omnistream-storage.json');
@@ -144,6 +147,22 @@ function setupAppMenu() {
 }
 
 function setupIpcHandlers() {
+  ipcMain.on('proxy:get-base-url-sync', (event) => {
+    event.returnValue = proxyInfo ? proxyInfo.proxyBaseUrl : '';
+  });
+
+  ipcMain.handle('proxy:get-base-url', async () => {
+    return proxyInfo ? proxyInfo.proxyBaseUrl : '';
+  });
+
+  ipcMain.handle('ftp:test-server', async (_event, url) => {
+    return await testFtpServer(url);
+  });
+
+  ipcMain.handle('ftp:list-dir', async (_event, url) => {
+    return await listFtpDirectory(url);
+  });
+
   ipcMain.handle('chrome:storage-get', async (_event, keys) => {
     if (!keys) return { ...storageCache };
     if (typeof keys === 'string') return { [keys]: storageCache[keys] };
@@ -223,7 +242,13 @@ if (!gotTheLock) {
     }
   });
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    try {
+      proxyInfo = await startMediaServer();
+    } catch (err) {
+      console.error('[Media Server] Failed to start:', err);
+    }
+    
     setupAppMenu();
     setupIpcHandlers();
     createBackgroundWindow();
