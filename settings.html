@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Configure OmniStream media library settings. Add open directories, Emby, Jellyfin servers, and adjust crawler, thumbnails, and library preferences.">
+  <title>OmniStream · Settings</title>
+  <link href="browser.css" rel="stylesheet">
+</head>
+<body class="settings-page">
+<div class="settings">
+
+  <div class="settings-head">
+    <div>
+      <h1>Settings</h1>
+      <p>Servers to index, how hard to crawl them, and how the library behaves.</p>
+    </div>
+    <a class="btn" href="browser.html" id="backBtn">← Back to library</a>
+  </div>
+
+  <!-- Unified Add Server -->
+  <section class="panel" id="addServerPanel">
+    <h2>Add Server</h2>
+    <p class="lead">Add an open directory, Emby/Jellyfin media server, or JS-rendered page. OmniStream can auto-detect the type or you can manually select it.</p>
+    <div class="note">Chrome dropped <code>ftp://</code> support, so enter the server's <strong>http://</strong> or <strong>https://</strong> address. OmniStream will ask for host permission if needed.</div>
+    <form id="unifiedAddForm" style="margin-top:14px;">
+      <div class="add-row" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <input class="input" id="unifiedAddInput" type="text" inputmode="url" placeholder="http://server.example.net/FILE/ or https://emby.example.com" autocomplete="off" spellcheck="false" aria-label="Server URL" style="flex:1; min-width:240px;">
+        <input class="input" id="unifiedNameInput" type="text" placeholder="Display Name (optional)" autocomplete="off" spellcheck="false" aria-label="Server Name" style="width:auto; min-width:140px;">
+        <select class="input" id="unifiedServerType" aria-label="Server type" style="width:auto; min-width:170px;">
+          <option value="auto">Auto-detect Type</option>
+          <option value="dir">Open Directory / Web</option>
+          <option value="emby">Media Server (Emby/Jellyfin)</option>
+          <option value="page">Rendered Page (JS/SPA)</option>
+        </select>
+        <button type="button" class="btn btn-sm" id="unifiedAuthToggleBtn" title="Show optional Emby/Jellyfin credentials">Credentials ▾</button>
+        <button class="btn btn-primary" type="submit" id="unifiedAddBtn">Add Server</button>
+      </div>
+
+      <!-- Authentication Credentials for Media Servers -->
+      <div class="field-grid hidden" id="unifiedAuthSection" style="margin-top:14px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.08);">
+        <div class="field" id="embyUserField">
+          <label for="embyUsername">Username</label>
+          <input class="input" id="embyUsername" type="text" autocomplete="off" spellcheck="false" placeholder="Username (optional for public servers)">
+        </div>
+        <div class="field" id="embyPassField">
+          <label for="embyPassword">Password</label>
+          <input class="input" id="embyPassword" type="password" autocomplete="off" placeholder="Password">
+        </div>
+        <div class="field hidden" id="embyKeyField">
+          <label for="embyApiKey">API Key</label>
+          <input class="input" id="embyApiKey" type="text" autocomplete="off" spellcheck="false" placeholder="Server API Key">
+        </div>
+        <div class="field" style="grid-column:1/-1; display:flex; justify-content:space-between; align-items:center;">
+          <button type="button" class="btn btn-sm" id="embyToggleAuthBtn">Use an API key instead</button>
+          <span style="font-size:12px; color:var(--text-muted, #888)">Only needed for protected Emby / Jellyfin media servers</span>
+        </div>
+      </div>
+    </form>
+  </section>
+
+  <!-- Servers -->
+  <section class="panel" id="serversPanel">
+    <h2>Open Directories</h2>
+    <p class="lead">Each directory is crawled recursively from its root URL.</p>
+    <div class="add-row hidden" id="serverFilterWrap" style="display: flex; gap: 8px;">
+      <input class="input" id="serverFilterInput" type="text" placeholder="Filter servers…" autocomplete="off" spellcheck="false" aria-label="Filter servers" style="flex: 1;">
+      <select class="input" id="serverSortSelect" aria-label="Sort servers" style="width: auto;">
+        <option value="name">Sort by Name</option>
+        <option value="added_desc">Newest First</option>
+        <option value="added_asc">Oldest First</option>
+      </select>
+    </div>
+    <div class="server-list" id="serverList"></div>
+    <div class="panel-actions">
+      <button class="btn btn-sm" id="enableAllBtn">Enable all</button>
+      <button class="btn btn-sm" id="disableAllBtn">Disable all</button>
+      <button class="btn btn-sm" id="exportBtn">Export list</button>
+      <button class="btn btn-sm" id="importBtn">Import list</button>
+      <input type="file" id="importFile" accept="application/json,.json,.txt" class="hidden">
+      <button class="btn btn-sm" id="restoreBtn">Restore defaults</button>
+    </div>
+  </section>
+
+  <!-- Media servers -->
+  <section class="panel" id="mediaServersPanel">
+    <h2>Media Servers</h2>
+    <p class="lead">Connected Emby or Jellyfin servers indexed alongside your open directories.</p>
+    <div class="server-list" id="mediaServerList" style="margin-top:14px"></div>
+  </section>
+
+  <!-- Rendered pages -->
+  <section class="panel" id="pageServersPanel">
+    <h2>Rendered Pages</h2>
+    <p class="lead">Sites loaded with JavaScript (SPAs, custom galleries) opened in a hidden tab to scan for media links.</p>
+    <div class="server-list" id="pageServerList" style="margin-top:14px"></div>
+  </section>
+
+  <!-- Crawler -->
+  <section class="panel">
+    <h2>Crawler</h2>
+    <p class="lead">Defaults are tuned for many hosts at once. Raise per-host connections only if a server is yours.</p>
+    <div class="field-grid">
+      <div class="field">
+        <label for="perHostConcurrency">Connections per host</label>
+        <input class="input" type="number" id="perHostConcurrency" min="1" max="16" step="1">
+        <div class="help">Chrome only opens 6 HTTP/1.1 sockets per host, so going above 6 rarely helps.</div>
+      </div>
+      <div class="field">
+        <label for="globalConcurrency">Total connections</label>
+        <input class="input" type="number" id="globalConcurrency" min="4" max="256" step="1">
+        <div class="help">Upper bound across all servers.</div>
+      </div>
+      <div class="field">
+        <label for="requestTimeoutMs">Request timeout (seconds)</label>
+        <input class="input" type="number" id="requestTimeoutMs" min="5" max="180" step="1">
+        <div class="help">A folder that takes longer is retried, then skipped.</div>
+      </div>
+      <div class="field">
+        <label for="retries">Retries per folder</label>
+        <input class="input" type="number" id="retries" min="0" max="6" step="1">
+      </div>
+      <div class="field">
+        <label for="maxDepth">Maximum folder depth</label>
+        <input class="input" type="number" id="maxDepth" min="1" max="40" step="1">
+        <div class="help">Guards against symlink loops on misconfigured servers.</div>
+      </div>
+      <div class="field">
+        <label class="toggle"><input type="checkbox" id="deepStreamResolveEnabled"><span class="track"></span><span>Deep Stream Resolution</span></label>
+        <div class="help">Fetch subpages to find and index .m3u8, .mpd and embedded player links.</div>
+      </div>
+      <div class="field">
+        <label for="deepStreamMaxDepth">Deep search depth</label>
+        <input class="input" type="number" id="deepStreamMaxDepth" min="1" max="5" step="1">
+        <div class="help">Maximum subpage hops to search for stream links.</div>
+      </div>
+      <div class="field">
+        <label class="toggle"><input type="checkbox" id="deepStreamUnlimited"><span class="track"></span><span>Unlimited multi-hopping</span></label>
+        <div class="help">Follow stream links indefinitely (ignores max depth).</div>
+      </div>
+      <div class="field">
+        <label class="toggle"><input type="checkbox" id="deepStreamAllowExternalOneHop"><span class="track"></span><span>Allow 1 external hop</span></label>
+        <div class="help">Follow external video player links 1 hop out if they match stream patterns.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Thumbnails -->
+  <section class="panel">
+    <h2>Thumbnails</h2>
+    <p class="lead">Frames are captured from the video itself as you scroll, then cached locally so they load instantly next time.</p>
+    <div class="field-grid">
+      <div class="field">
+        <label class="toggle"><input type="checkbox" id="thumbnailsEnabled"><span class="track"></span><span>Generate thumbnails</span></label>
+        <div class="help">Turn off on slow connections — each capture downloads a few megabytes.</div>
+      </div>
+      <div class="field">
+        <label for="thumbnailConcurrency">Captures at once</label>
+        <input class="input" type="number" id="thumbnailConcurrency" min="1" max="6" step="1">
+      </div>
+      <div class="field">
+        <label for="thumbnailSeekPercent">Capture position (% into video)</label>
+        <input class="input" type="number" id="thumbnailSeekPercent" min="1" max="60" step="1">
+        <div class="help">Skips intros and studio cards. Black frames are retried further in.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Library -->
+  <section class="panel">
+    <h2>Library</h2>
+    <div class="field-grid">
+      <div class="field">
+        <label for="itemsPerPage">Items per page</label>
+        <input class="input" type="number" id="itemsPerPage" min="20" max="300" step="10">
+      </div>
+      <div class="field">
+        <label class="toggle"><input type="checkbox" id="groupSeries"><span class="track"></span><span>Group series into folders</span></label>
+        <div class="help">Episodes (S01E02, Season 1…) collapse into one card per folder.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Data -->
+  <section class="panel">
+    <h2>Data</h2>
+    <div class="stat-row" id="dataStats">
+      <span><b id="statFiles">–</b> files indexed</span>
+      <span><b id="statThumbs">–</b> thumbnails cached</span>
+      <span><b id="statFavorites">–</b> favorites</span>
+      <span><b id="statStorage">–</b> on disk</span>
+      <span>last indexed <b id="statIndexed">never</b></span>
+    </div>
+    <div class="panel-actions">
+      <button class="btn btn-sm" id="clearThumbsBtn">Clear thumbnails</button>
+      <button class="btn btn-sm btn-danger" id="clearFavoritesBtn">Clear favorites</button>
+      <button class="btn btn-sm btn-danger" id="clearIndexBtn">Clear index</button>
+      <button class="btn btn-sm btn-danger" id="discardResumeBtn">Discard interrupted crawl</button>
+    </div>
+  </section>
+
+  <div class="save-bar">
+    <span class="status" id="saveStatus">Changes save automatically.</span>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<script src="shared.js"></script>
+<script src="settings.js"></script>
+</body>
+</html>
